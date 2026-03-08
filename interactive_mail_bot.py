@@ -4,6 +4,8 @@ import html
 import imaplib
 import json
 import os
+import time
+from collections import deque
 from email.header import decode_header
 from typing import Any
 
@@ -13,7 +15,19 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Appli
 CONFIG_FILE = "config.json"
 DEFAULT_POLL_INTERVAL = 60
 OWNER_CHAT_ID = 5127424995
+COMMAND_COOLDOWN_SECONDS = 3
+MAIL_BURST_LIMIT = 5
+MAIL_BURST_WINDOW = 60
+DEDUP_TTL_SECONDS = 3600
+SPAM_ALERT_COOLDOWN = 300
+
 poll_task = None
+
+command_cooldowns: dict[str, float] = {}
+mail_rate_limit: dict[str, deque] = {}
+recent_mail_fingerprints: dict[str, float] = {}
+spam_alert_state: dict[str, float] = {}
+suppressed_counts: dict[str, int] = {}
 
 IMAP_BY_DOMAIN = {
     "gmail.com": "imap.gmail.com",
@@ -134,6 +148,64 @@ def decode_mime_header(value: str) -> str:
     return "".join(result)
 
 
+def check_command_cooldown(command_name: str) -> bool:
+    now = time.time()
+    last_used = command_cooldowns.get(command_name, 0)
+    if now - last_used < COMMAND_COOLDOWN_SECONDS:
+        return False
+    command_cooldowns[command_name] = now
+    return True
+
+
+def cleanup_old_fingerprints() -> None:
+    now = time.time()
+    expired = [
+        key for key, ts in recent_mail_fingerprints.items()
+        if now - ts > DEDUP_TTL_SECONDS
+    ]
+    for key in expired:
+        del recent_mail_fingerprints[key]
+
+
+def is_duplicate_mail(mailbox_email: str, subject: str, from_header: str, body: str) -> bool:
+    cleanup_old_fingerprints()
+    short_body = (body or "")[:200].strip()
+    fingerprint = f"{mailbox_email}|{subject}|{from_header}|{short_body}"
+    now = time.time()
+
+    if fingerprint in recent_mail_fingerprints:
+        return True
+
+    recent_mail_fingerprints[fingerprint] = now
+    return False
+
+
+def can_send_mail_from_box(mailbox_email: str) -> bool:
+    now = time.time()
+    if mailbox_email not in mail_rate_limit:
+        mail_rate_limit[mailbox_email] = deque()
+
+    q = mail_rate_limit[mailbox_email]
+
+    while q and now - q[0] > MAIL_BURST_WINDOW:
+        q.popleft()
+
+    if len(q) >= MAIL_BURST_LIMIT:
+        return False
+
+    q.append(now)
+    return True
+
+
+def should_send_spam_alert(mailbox_email: str) -> bool:
+    now = time.time()
+    last_alert = spam_alert_state.get(mailbox_email, 0)
+    if now - last_alert < SPAM_ALERT_COOLDOWN:
+        return False
+    spam_alert_state[mailbox_email] = now
+    return True
+
+
 def build_start_text() -> str:
     return (
         "👋 <b>Привет! Я бот для пересылки почты в Telegram.</b>\n\n"
@@ -159,7 +231,8 @@ def build_help_text() -> str:
         "<b>Основные</b>\n"
         "/start — инструкция по запуску\n"
         "/help — список команд\n"
-        "/test — тестовое сообщение\n\n"
+        "/test — тестовое сообщение\n"
+        "/spam_status — статус антиспама\n\n"
         "<b>Почты</b>\n"
         "/add_email &lt;название&gt; &lt;email&gt; &lt;пароль&gt;\n"
         "Добавить почту с авто-IMAP\n"
@@ -209,7 +282,7 @@ def format_email_message(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
 
     config = load_config()
@@ -221,14 +294,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
+
+    if not check_command_cooldown("help"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
+        return
+
     await update.message.reply_text(build_help_text(), parse_mode="HTML")
 
 
 async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("add_email"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     if len(context.args) < 3:
@@ -278,7 +360,11 @@ async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("remove_email"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     if not context.args:
@@ -304,7 +390,11 @@ async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("list_emails"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     config = load_config()
@@ -330,7 +420,11 @@ async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("set_poll"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     if not context.args:
@@ -354,7 +448,11 @@ async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("show_config"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     config = load_config()
@@ -384,7 +482,11 @@ async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("test"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     text = (
@@ -405,11 +507,52 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Ошибка теста: {e}")
 
 
+async def spam_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update):
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("spam_status"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
+        return
+
+    config = load_config()
+    emails = config.get("emails", [])
+
+    if not emails:
+        await update.message.reply_text("Почты ещё не добавлены.")
+        return
+
+    lines = ["🛡 <b>Статус антиспама</b>\n"]
+
+    for mailbox in emails:
+        label = mailbox.get("label", "БЕЗ НАЗВАНИЯ")
+        email_addr = mailbox.get("email", "unknown")
+
+        queue = mail_rate_limit.get(email_addr, deque())
+        suppressed = suppressed_counts.get(email_addr, 0)
+        last_alert = spam_alert_state.get(email_addr, 0)
+
+        lines.append(
+            f"📮 <b>{escape_html(label)}</b>\n"
+            f"📧 <code>{escape_html(email_addr)}</code>\n"
+            f"• отправок в окне: {len(queue)}/{MAIL_BURST_LIMIT}\n"
+            f"• скрыто писем: {suppressed}\n"
+            f"• антиспам-уведомление: {'было' if last_alert else 'не было'}\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global poll_task
 
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("run"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     config = load_config()
@@ -430,7 +573,11 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global poll_task
 
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
+
+    if not check_command_cooldown("stop"):
+        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
         return
 
     if poll_task and not poll_task.done():
@@ -482,6 +629,25 @@ async def poll_mail_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                         from_header = decode_mime_header(message.get("From", "Неизвестно"))
                         body = extract_plain_text(message)
 
+                        if is_duplicate_mail(email_addr, subject, from_header, body):
+                            suppressed_counts[email_addr] = suppressed_counts.get(email_addr, 0) + 1
+                            continue
+
+                        if not can_send_mail_from_box(email_addr):
+                            suppressed_counts[email_addr] = suppressed_counts.get(email_addr, 0) + 1
+
+                            if should_send_spam_alert(email_addr):
+                                hidden_count = suppressed_counts.get(email_addr, 0)
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=(
+                                        f"⚠️ Слишком много писем с ящика "
+                                        f"{label}, часть сообщений скрыта.\n"
+                                        f"Скрыто писем: {hidden_count}"
+                                    ),
+                                )
+                            continue
+
                         text = format_email_message(
                             label=label,
                             mailbox_email=email_addr,
@@ -510,6 +676,7 @@ async def poll_mail_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 text=fallback_text[:4096],
                             )
 
+                        suppressed_counts[email_addr] = 0
                         seen_uids.add(uid)
                         changed = True
 
@@ -546,6 +713,7 @@ def main() -> None:
     application.add_handler(CommandHandler("set_poll", set_poll_cmd))
     application.add_handler(CommandHandler("show_config", show_config_cmd))
     application.add_handler(CommandHandler("test", test_cmd))
+    application.add_handler(CommandHandler("spam_status", spam_status_cmd))
     application.add_handler(CommandHandler("run", run_cmd))
     application.add_handler(CommandHandler("stop", stop_cmd))
 
