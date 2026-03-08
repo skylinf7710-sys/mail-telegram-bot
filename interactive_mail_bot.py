@@ -21,7 +21,9 @@ from telegram.ext import (
 
 CONFIG_FILE = "config.json"
 DEFAULT_POLL_INTERVAL = 60
-OWNER_CHAT_ID = 5127424995
+OWNER_IDS = [5127424995, 5408774698]
+ACCESS_DENIED_TEXT = "Этот бот доступен только @skylinf"
+
 MAIL_BURST_LIMIT = 5
 MAIL_BURST_WINDOW = 60
 DEDUP_TTL_SECONDS = 3600
@@ -34,7 +36,6 @@ recent_mail_fingerprints: dict[str, float] = {}
 spam_alert_state: dict[str, float] = {}
 suppressed_counts: dict[str, int] = {}
 
-# Состояния пошагового диалога
 STATE_IDLE = "idle"
 STATE_ADD_LABEL = "add_label"
 STATE_ADD_EMAIL = "add_email"
@@ -68,7 +69,11 @@ IMAP_BY_DOMAIN = {
 
 
 def is_owner(update) -> bool:
-    return update.effective_chat is not None and update.effective_chat.id == OWNER_CHAT_ID
+    return update.effective_chat is not None and update.effective_chat.id in OWNER_IDS
+
+
+def get_user_id(update) -> str:
+    return str(update.effective_chat.id)
 
 
 def guess_imap(email_value: str) -> str:
@@ -78,36 +83,66 @@ def guess_imap(email_value: str) -> str:
     return IMAP_BY_DOMAIN.get(domain, f"imap.{domain}")
 
 
+def make_mail_key(user_id: str, email_addr: str) -> str:
+    return f"{user_id}:{email_addr.lower()}"
+
+
 def load_config() -> dict[str, Any]:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "emails" not in data:
-                    data["emails"] = []
-                if "chat_id" not in data:
-                    data["chat_id"] = OWNER_CHAT_ID
-                if "poll_interval" not in data:
-                    data["poll_interval"] = DEFAULT_POLL_INTERVAL
-                if "ui_state" not in data:
-                    data["ui_state"] = STATE_IDLE
-                if "draft_email" not in data:
-                    data["draft_email"] = {}
-                return data
         except Exception:
-            pass
-    return {
-        "emails": [],
-        "chat_id": OWNER_CHAT_ID,
-        "poll_interval": DEFAULT_POLL_INTERVAL,
-        "ui_state": STATE_IDLE,
-        "draft_email": {},
-    }
+            data = {}
+    else:
+        data = {}
+
+    if "users" not in data:
+        data["users"] = {}
+
+    for owner_id in OWNER_IDS:
+        owner_key = str(owner_id)
+        if owner_key not in data["users"]:
+            data["users"][owner_key] = {
+                "emails": [],
+                "poll_interval": DEFAULT_POLL_INTERVAL,
+                "ui_state": STATE_IDLE,
+                "draft_email": {},
+            }
+        else:
+            user_data = data["users"][owner_key]
+            if "emails" not in user_data:
+                user_data["emails"] = []
+            if "poll_interval" not in user_data:
+                user_data["poll_interval"] = DEFAULT_POLL_INTERVAL
+            if "ui_state" not in user_data:
+                user_data["ui_state"] = STATE_IDLE
+            if "draft_email" not in user_data:
+                user_data["draft_email"] = {}
+
+    return data
 
 
 def save_config(config: dict[str, Any]) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def ensure_user(config: dict[str, Any], user_id: str) -> None:
+    if "users" not in config:
+        config["users"] = {}
+    if user_id not in config["users"]:
+        config["users"][user_id] = {
+            "emails": [],
+            "poll_interval": DEFAULT_POLL_INTERVAL,
+            "ui_state": STATE_IDLE,
+            "draft_email": {},
+        }
+
+
+def get_user_data(config: dict[str, Any], user_id: str) -> dict[str, Any]:
+    ensure_user(config, user_id)
+    return config["users"][user_id]
 
 
 def mask_email(email_value: str) -> str:
@@ -193,10 +228,10 @@ def cleanup_old_fingerprints() -> None:
         del recent_mail_fingerprints[key]
 
 
-def is_duplicate_mail(mailbox_email: str, subject: str, from_header: str, body: str) -> bool:
+def is_duplicate_mail(user_id: str, mailbox_email: str, subject: str, from_header: str, body: str) -> bool:
     cleanup_old_fingerprints()
     short_body = (body or "")[:200].strip()
-    fingerprint = f"{mailbox_email}|{subject}|{from_header}|{short_body}"
+    fingerprint = f"{user_id}|{mailbox_email}|{subject}|{from_header}|{short_body}"
     now = time.time()
 
     if fingerprint in recent_mail_fingerprints:
@@ -206,12 +241,14 @@ def is_duplicate_mail(mailbox_email: str, subject: str, from_header: str, body: 
     return False
 
 
-def can_send_mail_from_box(mailbox_email: str) -> bool:
+def can_send_mail_from_box(user_id: str, mailbox_email: str) -> bool:
     now = time.time()
-    if mailbox_email not in mail_rate_limit:
-        mail_rate_limit[mailbox_email] = deque()
+    key = make_mail_key(user_id, mailbox_email)
 
-    q = mail_rate_limit[mailbox_email]
+    if key not in mail_rate_limit:
+        mail_rate_limit[key] = deque()
+
+    q = mail_rate_limit[key]
 
     while q and now - q[0] > MAIL_BURST_WINDOW:
         q.popleft()
@@ -223,12 +260,13 @@ def can_send_mail_from_box(mailbox_email: str) -> bool:
     return True
 
 
-def should_send_spam_alert(mailbox_email: str) -> bool:
+def should_send_spam_alert(user_id: str, mailbox_email: str) -> bool:
     now = time.time()
-    last_alert = spam_alert_state.get(mailbox_email, 0)
+    key = make_mail_key(user_id, mailbox_email)
+    last_alert = spam_alert_state.get(key, 0)
     if now - last_alert < SPAM_ALERT_COOLDOWN:
         return False
-    spam_alert_state[mailbox_email] = now
+    spam_alert_state[key] = now
     return True
 
 
@@ -262,17 +300,17 @@ def format_email_message(
     )
 
 
-def build_start_text() -> str:
+def build_start_text(chat_id: int) -> str:
     return (
         "👋 <b>Привет! Я бот для пересылки почты в Telegram.</b>\n\n"
-        "✅ Уведомления будут приходить только вам.\n"
-        f"✅ Ваш chat_id уже привязан: <code>{OWNER_CHAT_ID}</code>\n\n"
+        f"✅ Ваш chat_id: <code>{chat_id}</code>\n"
+        "✅ У вас будут только ваши почты и только ваши уведомления.\n\n"
         "<b>Как пользоваться:</b>\n"
         "1. Нажмите <b>➕ Добавить почту</b>\n"
         "2. По шагам введите название, email и app password\n"
         "3. Нажмите <b>🧪 Тест</b>\n"
         "4. Нажмите <b>▶️ Запуск</b>\n\n"
-        "Все действия теперь через кнопки."
+        "Все действия выполняются через кнопки."
     )
 
 
@@ -285,35 +323,40 @@ def build_help_text() -> str:
         "• email\n"
         "• пароль приложения\n\n"
         "📋 <b>Почты</b>\n"
-        "Показывает все подключённые ящики.\n\n"
+        "Показывает только ваши подключённые ящики.\n\n"
         "🗑 <b>Удалить почту</b>\n"
-        "Показывает список, какую почту удалить.\n\n"
+        "Показывает только ваши почты.\n\n"
         "🧪 <b>Тест</b>\n"
         "Проверка, что бот умеет отправлять сообщения вам.\n\n"
         "▶️ <b>Запуск</b>\n"
-        "Начинает проверять почту.\n\n"
+        "Начинает проверять только ваши почты.\n\n"
         "⏹ <b>Стоп</b>\n"
         "Останавливает пересылку.\n\n"
         "🛡 <b>Антиспам</b>\n"
-        "Показывает состояние защиты от спама.\n\n"
+        "Показывает ваш статус антиспама.\n\n"
         "⚙️ <b>Настройки</b>\n"
-        "Показывает конфиг и текущий интервал проверки."
+        "Позволяет поменять ваш интервал проверки."
     )
+
+
+async def send_to_user(context: ContextTypes.DEFAULT_TYPE, user_id: int | str, text: str, parse_mode: str | None = None) -> None:
+    await context.bot.send_message(chat_id=int(user_id), text=text, parse_mode=parse_mode)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text(ACCESS_DENIED_TEXT)
         return
 
     config = load_config()
-    config["chat_id"] = OWNER_CHAT_ID
-    config["ui_state"] = STATE_IDLE
-    config["draft_email"] = {}
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    user_data["ui_state"] = STATE_IDLE
+    user_data["draft_email"] = {}
     save_config(config)
 
     await update.message.reply_text(
-        build_start_text(),
+        build_start_text(update.effective_chat.id),
         parse_mode="HTML",
         reply_markup=get_main_keyboard(),
     )
@@ -321,13 +364,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def show_emails(update: Update) -> None:
     config = load_config()
-    emails = config.get("emails", [])
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    emails = user_data.get("emails", [])
 
     if not emails:
         await update.message.reply_text("Почты ещё не добавлены.", reply_markup=get_main_keyboard())
         return
 
-    text = "📮 <b>Добавленные почты</b>\n\n"
+    text = "📮 <b>Ваши почты</b>\n\n"
     for idx, item in enumerate(emails, start=1):
         label = escape_html(item.get("label", "БЕЗ НАЗВАНИЯ"))
         addr = escape_html(mask_email(item["email"]))
@@ -343,9 +388,11 @@ async def show_emails(update: Update) -> None:
 
 async def show_config(update: Update) -> None:
     config = load_config()
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
 
     safe_emails = []
-    for item in config.get("emails", []):
+    for item in user_data.get("emails", []):
         safe_emails.append(
             {
                 "label": item.get("label", ""),
@@ -356,14 +403,14 @@ async def show_config(update: Update) -> None:
         )
 
     safe_config = {
+        "user_id": user_id,
         "emails": safe_emails,
-        "chat_id": OWNER_CHAT_ID,
-        "poll_interval": config.get("poll_interval", DEFAULT_POLL_INTERVAL),
-        "ui_state": config.get("ui_state", STATE_IDLE),
+        "poll_interval": user_data.get("poll_interval", DEFAULT_POLL_INTERVAL),
+        "ui_state": user_data.get("ui_state", STATE_IDLE),
     }
 
     await update.message.reply_text(
-        "⚙️ Текущая конфигурация:\n" +
+        "⚙️ Ваш конфиг:\n" +
         json.dumps(safe_config, indent=2, ensure_ascii=False),
         reply_markup=get_main_keyboard(),
     )
@@ -377,34 +424,30 @@ async def test_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Теперь можно нажать <b>▶️ Запуск</b>."
     )
 
-    try:
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=text,
-            parse_mode="HTML",
-        )
-        await update.message.reply_text("Тест отправлен.", reply_markup=get_main_keyboard())
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка теста: {e}", reply_markup=get_main_keyboard())
+    await send_to_user(context, update.effective_chat.id, text, parse_mode="HTML")
+    await update.message.reply_text("Тест отправлен.", reply_markup=get_main_keyboard())
 
 
 async def show_spam_status(update: Update) -> None:
     config = load_config()
-    emails = config.get("emails", [])
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    emails = user_data.get("emails", [])
 
     if not emails:
         await update.message.reply_text("Почты ещё не добавлены.", reply_markup=get_main_keyboard())
         return
 
-    lines = ["🛡 <b>Статус антиспама</b>\n"]
+    lines = ["🛡 <b>Ваш статус антиспама</b>\n"]
 
     for mailbox in emails:
         label = mailbox.get("label", "БЕЗ НАЗВАНИЯ")
         email_addr = mailbox.get("email", "unknown")
+        key = make_mail_key(user_id, email_addr)
 
-        queue = mail_rate_limit.get(email_addr, deque())
-        suppressed = suppressed_counts.get(email_addr, 0)
-        last_alert = spam_alert_state.get(email_addr, 0)
+        queue = mail_rate_limit.get(key, deque())
+        suppressed = suppressed_counts.get(key, 0)
+        last_alert = spam_alert_state.get(key, 0)
 
         lines.append(
             f"📮 <b>{escape_html(label)}</b>\n"
@@ -421,7 +464,10 @@ async def start_polling(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     global poll_task
 
     config = load_config()
-    if not config.get("emails"):
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+
+    if not user_data.get("emails"):
         await update.message.reply_text(
             "Сначала добавьте хотя бы одну почту через кнопку ➕ Добавить почту.",
             reply_markup=get_main_keyboard(),
@@ -448,8 +494,10 @@ async def stop_polling(update: Update) -> None:
 
 async def begin_add_email(update: Update) -> None:
     config = load_config()
-    config["ui_state"] = STATE_ADD_LABEL
-    config["draft_email"] = {}
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    user_data["ui_state"] = STATE_ADD_LABEL
+    user_data["draft_email"] = {}
     save_config(config)
 
     await update.message.reply_text(
@@ -460,7 +508,9 @@ async def begin_add_email(update: Update) -> None:
 
 async def begin_remove_email(update: Update) -> None:
     config = load_config()
-    emails = config.get("emails", [])
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    emails = user_data.get("emails", [])
 
     if not emails:
         await update.message.reply_text("Почты ещё не добавлены.", reply_markup=get_main_keyboard())
@@ -470,7 +520,7 @@ async def begin_remove_email(update: Update) -> None:
     for idx, item in enumerate(emails, start=1):
         text += f"{idx}. {item.get('label', 'БЕЗ НАЗВАНИЯ')} — {item['email']}\n"
 
-    config["ui_state"] = STATE_REMOVE_SELECT
+    user_data["ui_state"] = STATE_REMOVE_SELECT
     save_config(config)
 
     await update.message.reply_text(text, reply_markup=get_main_keyboard())
@@ -478,7 +528,9 @@ async def begin_remove_email(update: Update) -> None:
 
 async def begin_set_poll(update: Update) -> None:
     config = load_config()
-    config["ui_state"] = STATE_SET_POLL
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    user_data["ui_state"] = STATE_SET_POLL
     save_config(config)
 
     await update.message.reply_text(
@@ -489,8 +541,10 @@ async def begin_set_poll(update: Update) -> None:
 
 async def cancel_action(update: Update) -> None:
     config = load_config()
-    config["ui_state"] = STATE_IDLE
-    config["draft_email"] = {}
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    user_data["ui_state"] = STATE_IDLE
+    user_data["draft_email"] = {}
     save_config(config)
 
     await update.message.reply_text("Действие отменено.", reply_markup=get_main_keyboard())
@@ -498,14 +552,15 @@ async def cancel_action(update: Update) -> None:
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text(ACCESS_DENIED_TEXT)
         return
 
     text = (update.message.text or "").strip()
     config = load_config()
-    state = config.get("ui_state", STATE_IDLE)
+    user_id = get_user_id(update)
+    user_data = get_user_data(config, user_id)
+    state = user_data.get("ui_state", STATE_IDLE)
 
-    # Кнопки главного меню
     if text == "➕ Добавить почту":
         await begin_add_email(update)
         return
@@ -541,10 +596,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await cancel_action(update)
         return
 
-    # Пошаговый диалог
     if state == STATE_ADD_LABEL:
-        config["draft_email"]["label"] = text
-        config["ui_state"] = STATE_ADD_EMAIL
+        user_data["draft_email"]["label"] = text
+        user_data["ui_state"] = STATE_ADD_EMAIL
         save_config(config)
         await update.message.reply_text("Теперь введите email ящика.")
         return
@@ -553,8 +607,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if "@" not in text:
             await update.message.reply_text("Это не похоже на email. Введите email ещё раз.")
             return
-        config["draft_email"]["email"] = text
-        config["ui_state"] = STATE_ADD_PASSWORD
+        user_data["draft_email"]["email"] = text
+        user_data["ui_state"] = STATE_ADD_PASSWORD
         save_config(config)
         await update.message.reply_text(
             "Теперь введите пароль приложения (app password).\n"
@@ -563,14 +617,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if state == STATE_ADD_PASSWORD:
-        label = config["draft_email"].get("label", "БЕЗ НАЗВАНИЯ")
-        email_value = config["draft_email"].get("email", "")
+        label = user_data["draft_email"].get("label", "БЕЗ НАЗВАНИЯ")
+        email_value = user_data["draft_email"].get("email", "")
         password = text
         imap_host = guess_imap(email_value)
 
         if not email_value or not imap_host:
-            config["ui_state"] = STATE_IDLE
-            config["draft_email"] = {}
+            user_data["ui_state"] = STATE_IDLE
+            user_data["draft_email"] = {}
             save_config(config)
             await update.message.reply_text(
                 "Не удалось добавить почту. Попробуйте снова.",
@@ -578,10 +632,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        for item in config["emails"]:
+        for item in user_data["emails"]:
             if item["email"].lower() == email_value.lower():
-                config["ui_state"] = STATE_IDLE
-                config["draft_email"] = {}
+                user_data["ui_state"] = STATE_IDLE
+                user_data["draft_email"] = {}
                 save_config(config)
                 await update.message.reply_text(
                     "Такая почта уже добавлена.",
@@ -589,7 +643,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 )
                 return
 
-        config["emails"].append(
+        user_data["emails"].append(
             {
                 "label": label,
                 "email": email_value,
@@ -598,8 +652,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "seen_uids": [],
             }
         )
-        config["ui_state"] = STATE_IDLE
-        config["draft_email"] = {}
+        user_data["ui_state"] = STATE_IDLE
+        user_data["draft_email"] = {}
         save_config(config)
 
         await update.message.reply_text(
@@ -618,14 +672,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Введите именно номер почты из списка.")
             return
 
-        emails = config.get("emails", [])
+        emails = user_data.get("emails", [])
         if idx < 1 or idx > len(emails):
             await update.message.reply_text("Такого номера нет. Попробуйте ещё раз.")
             return
 
         removed = emails.pop(idx - 1)
-        config["emails"] = emails
-        config["ui_state"] = STATE_IDLE
+        user_data["emails"] = emails
+        user_data["ui_state"] = STATE_IDLE
         save_config(config)
 
         await update.message.reply_text(
@@ -643,8 +697,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Введите число не меньше 10.")
             return
 
-        config["poll_interval"] = interval
-        config["ui_state"] = STATE_IDLE
+        user_data["poll_interval"] = interval
+        user_data["ui_state"] = STATE_IDLE
         save_config(config)
 
         await update.message.reply_text(
@@ -653,7 +707,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Если просто текст вне сценария
     await update.message.reply_text(
         "Используйте кнопки ниже.",
         reply_markup=get_main_keyboard(),
@@ -663,112 +716,109 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def poll_mail_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
     while True:
         config = load_config()
-        chat_id = OWNER_CHAT_ID
-        interval = int(config.get("poll_interval", DEFAULT_POLL_INTERVAL))
-        emails = config.get("emails", [])
 
-        for mailbox in emails:
-            try:
-                label = mailbox.get("label", "БЕЗ НАЗВАНИЯ")
-                email_addr = mailbox["email"]
-                password = mailbox["password"]
-                imap_host = mailbox["imap"]
-                seen_uids = set(mailbox.get("seen_uids", []))
+        for owner_id in OWNER_IDS:
+            user_id = str(owner_id)
+            user_data = get_user_data(config, user_id)
+            interval = int(user_data.get("poll_interval", DEFAULT_POLL_INTERVAL))
+            emails = user_data.get("emails", [])
 
-                with imaplib.IMAP4_SSL(imap_host) as imap:
-                    imap.login(email_addr, password)
-                    imap.select("INBOX")
+            for mailbox in emails:
+                try:
+                    label = mailbox.get("label", "БЕЗ НАЗВАНИЯ")
+                    email_addr = mailbox["email"]
+                    password = mailbox["password"]
+                    imap_host = mailbox["imap"]
+                    seen_uids = set(mailbox.get("seen_uids", []))
 
-                    status, data = imap.search(None, "UNSEEN")
-                    if status != "OK":
-                        continue
+                    with imaplib.IMAP4_SSL(imap_host) as imap:
+                        imap.login(email_addr, password)
+                        imap.select("INBOX")
 
-                    changed = False
-
-                    for num in data[0].split():
-                        uid = num.decode()
-
-                        if uid in seen_uids:
+                        status, data = imap.search(None, "UNSEEN")
+                        if status != "OK":
                             continue
 
-                        status, msg_data = imap.fetch(num, "(RFC822)")
-                        if status != "OK" or not msg_data:
-                            continue
+                        changed = False
 
-                        raw_email = msg_data[0][1]
-                        message = email.message_from_bytes(raw_email)
+                        for num in data[0].split():
+                            uid = num.decode()
 
-                        subject = decode_mime_header(message.get("Subject", "Без темы"))
-                        from_header = decode_mime_header(message.get("From", "Неизвестно"))
-                        body = extract_plain_text(message)
+                            if uid in seen_uids:
+                                continue
 
-                        if is_duplicate_mail(email_addr, subject, from_header, body):
-                            suppressed_counts[email_addr] = suppressed_counts.get(email_addr, 0) + 1
-                            continue
+                            status, msg_data = imap.fetch(num, "(RFC822)")
+                            if status != "OK" or not msg_data:
+                                continue
 
-                        if not can_send_mail_from_box(email_addr):
-                            suppressed_counts[email_addr] = suppressed_counts.get(email_addr, 0) + 1
+                            raw_email = msg_data[0][1]
+                            message = email.message_from_bytes(raw_email)
 
-                            if should_send_spam_alert(email_addr):
-                                hidden_count = suppressed_counts.get(email_addr, 0)
-                                await context.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=(
-                                        f"⚠️ Слишком много писем с ящика "
-                                        f"{label}, часть сообщений скрыта.\n"
-                                        f"Скрыто писем: {hidden_count}"
-                                    ),
-                                )
-                            continue
+                            subject = decode_mime_header(message.get("Subject", "Без темы"))
+                            from_header = decode_mime_header(message.get("From", "Неизвестно"))
+                            body = extract_plain_text(message)
 
-                        text = format_email_message(
-                            label=label,
-                            mailbox_email=email_addr,
-                            from_header=from_header,
-                            subject=subject,
-                            body=body,
-                        )
+                            if is_duplicate_mail(user_id, email_addr, subject, from_header, body):
+                                key = make_mail_key(user_id, email_addr)
+                                suppressed_counts[key] = suppressed_counts.get(key, 0) + 1
+                                continue
 
-                        try:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=text[:4096],
-                                parse_mode="HTML",
-                            )
-                        except Exception:
-                            fallback_text = (
-                                f"НОВОЕ ПИСЬМО\n"
-                                f"Ящик: {label}\n"
-                                f"Адрес: {email_addr}\n"
-                                f"От: {from_header}\n"
-                                f"Тема: {subject}\n\n"
-                                f"{body or '[пустое сообщение]'}"
-                            )
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=fallback_text[:4096],
+                            if not can_send_mail_from_box(user_id, email_addr):
+                                key = make_mail_key(user_id, email_addr)
+                                suppressed_counts[key] = suppressed_counts.get(key, 0) + 1
+
+                                if should_send_spam_alert(user_id, email_addr):
+                                    hidden_count = suppressed_counts.get(key, 0)
+                                    await send_to_user(
+                                        context,
+                                        owner_id,
+                                        (
+                                            f"⚠️ Слишком много писем с ящика "
+                                            f"{label}, часть сообщений скрыта.\n"
+                                            f"Скрыто писем: {hidden_count}"
+                                        ),
+                                    )
+                                continue
+
+                            text = format_email_message(
+                                label=label,
+                                mailbox_email=email_addr,
+                                from_header=from_header,
+                                subject=subject,
+                                body=body,
                             )
 
-                        suppressed_counts[email_addr] = 0
-                        seen_uids.add(uid)
-                        changed = True
+                            await send_to_user(context, owner_id, text[:4096], parse_mode="HTML")
 
-                    if changed:
-                        mailbox["seen_uids"] = list(seen_uids)[-300:]
+                            key = make_mail_key(user_id, email_addr)
+                            suppressed_counts[key] = 0
+                            seen_uids.add(uid)
+                            changed = True
 
-            except imaplib.IMAP4.error as e:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ Ошибка IMAP для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
-                )
-            except Exception as e:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"❌ Ошибка для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
-                )
+                        if changed:
+                            mailbox["seen_uids"] = list(seen_uids)[-300:]
+
+                except imaplib.IMAP4.error as e:
+                    await send_to_user(
+                        context,
+                        owner_id,
+                        f"❌ Ошибка IMAP для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
+                    )
+                except Exception as e:
+                    await send_to_user(
+                        context,
+                        owner_id,
+                        f"❌ Ошибка для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
+                    )
 
         save_config(config)
-        await asyncio.sleep(interval)
+
+        # Берём минимальный интервал среди пользователей
+        intervals = [
+            int(get_user_data(config, str(owner_id)).get("poll_interval", DEFAULT_POLL_INTERVAL))
+            for owner_id in OWNER_IDS
+        ]
+        await asyncio.sleep(min(intervals) if intervals else DEFAULT_POLL_INTERVAL)
 
 
 def main() -> None:
@@ -779,9 +829,11 @@ def main() -> None:
     application: Application = ApplicationBuilder().token(token).build()
 
     application.add_handler(CommandHandler("start", start))
+    allowed_chat_filters = filters.Chat(chat_id=OWNER_IDS[0]) | filters.Chat(chat_id=OWNER_IDS[1])
+
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Chat(chat_id=OWNER_CHAT_ID),
+            filters.TEXT & ~filters.COMMAND & allowed_chat_filters,
             handle_text,
         )
     )
