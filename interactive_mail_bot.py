@@ -4,13 +4,17 @@ import html
 import imaplib
 import json
 import os
+from email.header import decode_header
+from typing import Any
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Application
 
+CONFIG_FILE = "config.json"
+DEFAULT_POLL_INTERVAL = 60
 OWNER_CHAT_ID = 5127424995
+poll_task = None
 
-def is_owner(update) -> bool:
-    return update.effective_chat is not None and update.effective_chat.id == OWNER_CHAT_ID
 IMAP_BY_DOMAIN = {
     "gmail.com": "imap.gmail.com",
     "googlemail.com": "imap.gmail.com",
@@ -35,20 +39,16 @@ IMAP_BY_DOMAIN = {
     "yahoo.co.uk": "imap.mail.yahoo.com",
 }
 
+
+def is_owner(update) -> bool:
+    return update.effective_chat is not None and update.effective_chat.id == OWNER_CHAT_ID
+
+
 def guess_imap(email_value: str) -> str:
     if "@" not in email_value:
         return ""
     domain = email_value.split("@", 1)[1].lower().strip()
     return IMAP_BY_DOMAIN.get(domain, f"imap.{domain}")
-from email.header import decode_header
-from typing import Any
-
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Application
-
-CONFIG_FILE = "config.json"
-DEFAULT_POLL_INTERVAL = 60
-poll_task = None
 
 
 def load_config() -> dict[str, Any]:
@@ -58,12 +58,16 @@ def load_config() -> dict[str, Any]:
                 data = json.load(f)
                 if "emails" not in data:
                     data["emails"] = []
+                if "chat_id" not in data:
+                    data["chat_id"] = OWNER_CHAT_ID
+                if "poll_interval" not in data:
+                    data["poll_interval"] = DEFAULT_POLL_INTERVAL
                 return data
         except Exception:
             pass
     return {
         "emails": [],
-        "chat_id": "",
+        "chat_id": OWNER_CHAT_ID,
         "poll_interval": DEFAULT_POLL_INTERVAL,
     }
 
@@ -133,22 +137,19 @@ def decode_mime_header(value: str) -> str:
 def build_start_text() -> str:
     return (
         "👋 <b>Привет! Я бот для пересылки почты в Telegram.</b>\n\n"
-        "Я умею:\n"
-        "• подключать несколько почтовых ящиков\n"
-        "• проверять новые письма\n"
-        "• пересылать их сюда, в Telegram\n\n"
+        "✅ <b>Уведомления будут приходить только вам.</b>\n"
+        f"Ваш chat_id уже привязан: <code>{OWNER_CHAT_ID}</code>\n\n"
         "<b>Как начать:</b>\n"
-        "1. Узнай свой chat_id\n"
-        "2. Укажи его командой <code>/set_chat_id ID</code>\n"
-        "3. Добавь почту командой:\n"
-        "<code>/add_email НАЗВАНИЕ email пароль imap</code>\n"
-        "4. Проверь отправку командой <code>/test</code>\n"
-        "5. Запусти пересылку командой <code>/run</code>\n\n"
-        "<b>Пример:</b>\n"
-        "<code>/set_chat_id 123456789</code>\n"
-        "<code>/add_email ЛИЧНАЯ mymail@gmail.com apppassword imap.gmail.com</code>\n"
+        "1. Добавьте почту:\n"
+        "<code>/add_email ЛИЧНАЯ mymail@gmail.com apppassword</code>\n\n"
+        "2. Проверьте отправку:\n"
+        "<code>/test</code>\n\n"
+        "3. Запустите пересылку:\n"
         "<code>/run</code>\n\n"
-        "ℹ️ Для списка всех команд напиши: <code>/help</code>"
+        "<b>Важно:</b>\n"
+        "• Для Gmail нужен <b>App Password</b>, а не обычный пароль\n"
+        "• IMAP подставляется автоматически\n\n"
+        "ℹ️ Все команды: <code>/help</code>"
     )
 
 
@@ -157,11 +158,11 @@ def build_help_text() -> str:
         "📚 <b>Команды бота</b>\n\n"
         "<b>Основные</b>\n"
         "/start — инструкция по запуску\n"
-        "/help — список всех команд\n"
+        "/help — список команд\n"
         "/test — тестовое сообщение\n\n"
         "<b>Почты</b>\n"
         "/add_email &lt;название&gt; &lt;email&gt; &lt;пароль&gt;\n"
-        "Добавить почту с авто-определением IMAP\n"
+        "Добавить почту с авто-IMAP\n"
         "Пример:\n"
         "<code>/add_email ЛИЧНАЯ mymail@gmail.com apppassword</code>\n\n"
         "/remove_email &lt;email&gt; — удалить почту\n"
@@ -172,8 +173,9 @@ def build_help_text() -> str:
         "<b>Управление</b>\n"
         "/run — запустить пересылку\n"
         "/stop — остановить пересылку\n\n"
-        "⚠️ Бот отправляет уведомления только владельцу."
+        "⚠️ Бот доступен только владельцу."
     )
+
 
 def format_email_message(
     label: str,
@@ -207,40 +209,26 @@ def format_email_message(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
 
     config = load_config()
     config["chat_id"] = OWNER_CHAT_ID
     save_config(config)
 
-    text = (
-        "👋 <b>Привет! Я бот для пересылки почты в Telegram.</b>\n\n"
-        "✅ <b>Чат автоматически привязан.</b>\n"
-        f"Ваш chat_id: <code>{OWNER_CHAT_ID}</code>\n\n"
-        "<b>Как пользоваться:</b>\n"
-        "1. Добавить почту:\n"
-        "<code>/add_email ЛИЧНАЯ mymail@gmail.com apppassword</code>\n\n"
-        "2. Проверить отправку:\n"
-        "<code>/test</code>\n\n"
-        "3. Запустить пересылку:\n"
-        "<code>/run</code>\n\n"
-        "ℹ️ Список всех команд: /help"
-    )
-
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(build_start_text(), parse_mode="HTML")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
     await update.message.reply_text(build_help_text(), parse_mode="HTML")
 
 
 async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
 
     if len(context.args) < 3:
@@ -286,19 +274,13 @@ async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Адрес: {email_value}\n"
         f"IMAP: {imap_host}"
     )
-    save_config(config)
-
-    await update.message.reply_text(
-        f"✅ Почта добавлена.\n"
-        f"Название: {label}\n"
-        f"Адрес: {email_value}"
-    )
 
 
 async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
+
     if not context.args:
         await update.message.reply_text("Использование:\n/remove_email <email>")
         return
@@ -322,8 +304,9 @@ async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
+
     config = load_config()
     emails = config.get("emails", [])
 
@@ -345,26 +328,11 @@ async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(text, parse_mode="HTML")
 
 
-async def set_chat_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
-        return
-    if not context.args:
-        await update.message.reply_text("Использование:\n/set_chat_id <chat_id>")
-        return
-
-    chat_id = context.args[0].strip()
-    config = load_config()
-    config["chat_id"] = chat_id
-    save_config(config)
-
-    await update.message.reply_text(f"✅ chat_id установлен: {chat_id}")
-
-
 async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
+
     if not context.args:
         await update.message.reply_text("Использование:\n/set_poll <секунды>")
         return
@@ -386,8 +354,9 @@ async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
+
     config = load_config()
 
     safe_emails = []
@@ -403,7 +372,7 @@ async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     safe_config = {
         "emails": safe_emails,
-        "chat_id": config.get("chat_id", ""),
+        "chat_id": OWNER_CHAT_ID,
         "poll_interval": config.get("poll_interval", DEFAULT_POLL_INTERVAL),
     }
 
@@ -415,25 +384,19 @@ async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
-        return
-    config = load_config()
-    chat_id = config.get("chat_id", "")
-
-    if not chat_id:
-        await update.message.reply_text("Сначала установи chat_id через /set_chat_id")
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
 
     text = (
         "✅ <b>Тестовое сообщение</b>\n"
         "══════════════════\n"
-        "Бот умеет отправлять сообщения в указанный chat_id.\n\n"
+        "Бот умеет отправлять сообщения в ваш чат.\n\n"
         "Теперь можно использовать /run"
     )
 
     try:
         await context.bot.send_message(
-            chat_id=chat_id,
+            chat_id=OWNER_CHAT_ID,
             text=text,
             parse_mode="HTML",
         )
@@ -443,16 +406,13 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
-        return
     global poll_task
 
-    config = load_config()
-
-    if not config.get("chat_id"):
-        await update.message.reply_text("Сначала установи chat_id через /set_chat_id")
+    if not is_owner(update):
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
+
+    config = load_config()
 
     if not config.get("emails"):
         await update.message.reply_text("Сначала добавь хотя бы одну почту через /add_email")
@@ -467,10 +427,11 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
-        return
     global poll_task
+
+    if not is_owner(update):
+        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        return
 
     if poll_task and not poll_task.done():
         poll_task.cancel()
@@ -480,12 +441,9 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def poll_mail_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
-        return
     while True:
         config = load_config()
-        chat_id = config.get("chat_id", "")
+        chat_id = OWNER_CHAT_ID
         interval = int(config.get("poll_interval", DEFAULT_POLL_INTERVAL))
         emails = config.get("emails", [])
 
@@ -559,17 +517,15 @@ async def poll_mail_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
                         mailbox["seen_uids"] = list(seen_uids)[-300:]
 
             except imaplib.IMAP4.error as e:
-                if chat_id:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ Ошибка IMAP для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
-                    )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Ошибка IMAP для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
+                )
             except Exception as e:
-                if chat_id:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ Ошибка для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
-                    )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Ошибка для {mailbox.get('label', mailbox.get('email', 'unknown'))}: {e}",
+                )
 
         save_config(config)
         await asyncio.sleep(interval)
@@ -587,7 +543,6 @@ def main() -> None:
     application.add_handler(CommandHandler("add_email", add_email_cmd))
     application.add_handler(CommandHandler("remove_email", remove_email_cmd))
     application.add_handler(CommandHandler("list_emails", list_emails_cmd))
-    application.add_handler(CommandHandler("set_chat_id", set_chat_id_cmd))
     application.add_handler(CommandHandler("set_poll", set_poll_cmd))
     application.add_handler(CommandHandler("show_config", show_config_cmd))
     application.add_handler(CommandHandler("test", test_cmd))
