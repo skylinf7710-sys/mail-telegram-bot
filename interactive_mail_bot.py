@@ -9,13 +9,19 @@ from collections import deque
 from email.header import decode_header
 from typing import Any
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Application
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    Application,
+    MessageHandler,
+    filters,
+)
 
 CONFIG_FILE = "config.json"
 DEFAULT_POLL_INTERVAL = 60
 OWNER_CHAT_ID = 5127424995
-COMMAND_COOLDOWN_SECONDS = 3
 MAIL_BURST_LIMIT = 5
 MAIL_BURST_WINDOW = 60
 DEDUP_TTL_SECONDS = 3600
@@ -23,11 +29,18 @@ SPAM_ALERT_COOLDOWN = 300
 
 poll_task = None
 
-command_cooldowns: dict[str, float] = {}
 mail_rate_limit: dict[str, deque] = {}
 recent_mail_fingerprints: dict[str, float] = {}
 spam_alert_state: dict[str, float] = {}
 suppressed_counts: dict[str, int] = {}
+
+# Состояния пошагового диалога
+STATE_IDLE = "idle"
+STATE_ADD_LABEL = "add_label"
+STATE_ADD_EMAIL = "add_email"
+STATE_ADD_PASSWORD = "add_password"
+STATE_REMOVE_SELECT = "remove_select"
+STATE_SET_POLL = "set_poll"
 
 IMAP_BY_DOMAIN = {
     "gmail.com": "imap.gmail.com",
@@ -76,6 +89,10 @@ def load_config() -> dict[str, Any]:
                     data["chat_id"] = OWNER_CHAT_ID
                 if "poll_interval" not in data:
                     data["poll_interval"] = DEFAULT_POLL_INTERVAL
+                if "ui_state" not in data:
+                    data["ui_state"] = STATE_IDLE
+                if "draft_email" not in data:
+                    data["draft_email"] = {}
                 return data
         except Exception:
             pass
@@ -83,6 +100,8 @@ def load_config() -> dict[str, Any]:
         "emails": [],
         "chat_id": OWNER_CHAT_ID,
         "poll_interval": DEFAULT_POLL_INTERVAL,
+        "ui_state": STATE_IDLE,
+        "draft_email": {},
     }
 
 
@@ -102,6 +121,22 @@ def mask_email(email_value: str) -> str:
 
 def escape_html(text: str) -> str:
     return html.escape(text or "")
+
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton("➕ Добавить почту"), KeyboardButton("📋 Почты")],
+        [KeyboardButton("🗑 Удалить почту"), KeyboardButton("▶️ Запуск")],
+        [KeyboardButton("⏹ Стоп"), KeyboardButton("🧪 Тест")],
+        [KeyboardButton("🛡 Антиспам"), KeyboardButton("⚙️ Настройки")],
+        [KeyboardButton("❓ Помощь"), KeyboardButton("❌ Отмена")],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        selective=True,
+    )
 
 
 def extract_plain_text(message: email.message.Message) -> str:
@@ -146,15 +181,6 @@ def decode_mime_header(value: str) -> str:
         else:
             result.append(part)
     return "".join(result)
-
-
-def check_command_cooldown(command_name: str) -> bool:
-    now = time.time()
-    last_used = command_cooldowns.get(command_name, 0)
-    if now - last_used < COMMAND_COOLDOWN_SECONDS:
-        return False
-    command_cooldowns[command_name] = now
-    return True
 
 
 def cleanup_old_fingerprints() -> None:
@@ -206,50 +232,6 @@ def should_send_spam_alert(mailbox_email: str) -> bool:
     return True
 
 
-def build_start_text() -> str:
-    return (
-        "👋 <b>Привет! Я бот для пересылки почты в Telegram.</b>\n\n"
-        "✅ <b>Уведомления будут приходить только вам.</b>\n"
-        f"Ваш chat_id уже привязан: <code>{OWNER_CHAT_ID}</code>\n\n"
-        "<b>Как начать:</b>\n"
-        "1. Добавьте почту:\n"
-        "<code>/add_email ЛИЧНАЯ mymail@gmail.com apppassword</code>\n\n"
-        "2. Проверьте отправку:\n"
-        "<code>/test</code>\n\n"
-        "3. Запустите пересылку:\n"
-        "<code>/run</code>\n\n"
-        "<b>Важно:</b>\n"
-        "• Для Gmail нужен <b>App Password</b>, а не обычный пароль\n"
-        "• IMAP подставляется автоматически\n\n"
-        "ℹ️ Все команды: <code>/help</code>"
-    )
-
-
-def build_help_text() -> str:
-    return (
-        "📚 <b>Команды бота</b>\n\n"
-        "<b>Основные</b>\n"
-        "/start — инструкция по запуску\n"
-        "/help — список команд\n"
-        "/test — тестовое сообщение\n"
-        "/spam_status — статус антиспама\n\n"
-        "<b>Почты</b>\n"
-        "/add_email &lt;название&gt; &lt;email&gt; &lt;пароль&gt;\n"
-        "Добавить почту с авто-IMAP\n"
-        "Пример:\n"
-        "<code>/add_email ЛИЧНАЯ mymail@gmail.com apppassword</code>\n\n"
-        "/remove_email &lt;email&gt; — удалить почту\n"
-        "/list_emails — показать все почты\n\n"
-        "<b>Настройки</b>\n"
-        "/set_poll &lt;секунды&gt; — интервал проверки\n"
-        "/show_config — показать конфиг\n\n"
-        "<b>Управление</b>\n"
-        "/run — запустить пересылку\n"
-        "/stop — остановить пересылку\n\n"
-        "⚠️ Бот доступен только владельцу."
-    )
-
-
 def format_email_message(
     label: str,
     mailbox_email: str,
@@ -280,6 +262,45 @@ def format_email_message(
     )
 
 
+def build_start_text() -> str:
+    return (
+        "👋 <b>Привет! Я бот для пересылки почты в Telegram.</b>\n\n"
+        "✅ Уведомления будут приходить только вам.\n"
+        f"✅ Ваш chat_id уже привязан: <code>{OWNER_CHAT_ID}</code>\n\n"
+        "<b>Как пользоваться:</b>\n"
+        "1. Нажмите <b>➕ Добавить почту</b>\n"
+        "2. По шагам введите название, email и app password\n"
+        "3. Нажмите <b>🧪 Тест</b>\n"
+        "4. Нажмите <b>▶️ Запуск</b>\n\n"
+        "Все действия теперь через кнопки."
+    )
+
+
+def build_help_text() -> str:
+    return (
+        "📚 <b>Как пользоваться ботом</b>\n\n"
+        "➕ <b>Добавить почту</b>\n"
+        "Бот по шагам спросит:\n"
+        "• название ящика\n"
+        "• email\n"
+        "• пароль приложения\n\n"
+        "📋 <b>Почты</b>\n"
+        "Показывает все подключённые ящики.\n\n"
+        "🗑 <b>Удалить почту</b>\n"
+        "Показывает список, какую почту удалить.\n\n"
+        "🧪 <b>Тест</b>\n"
+        "Проверка, что бот умеет отправлять сообщения вам.\n\n"
+        "▶️ <b>Запуск</b>\n"
+        "Начинает проверять почту.\n\n"
+        "⏹ <b>Стоп</b>\n"
+        "Останавливает пересылку.\n\n"
+        "🛡 <b>Антиспам</b>\n"
+        "Показывает состояние защиты от спама.\n\n"
+        "⚙️ <b>Настройки</b>\n"
+        "Показывает конфиг и текущий интервал проверки."
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
@@ -287,121 +308,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     config = load_config()
     config["chat_id"] = OWNER_CHAT_ID
-    save_config(config)
-
-    await update.message.reply_text(build_start_text(), parse_mode="HTML")
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("help"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
-    await update.message.reply_text(build_help_text(), parse_mode="HTML")
-
-
-async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("add_email"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
-    if len(context.args) < 3:
-        await update.message.reply_text(
-            "Использование:\n"
-            "/add_email <название> <email> <password>\n\n"
-            "Пример:\n"
-            "/add_email ЛИЧНАЯ mymail@gmail.com apppassword"
-        )
-        return
-
-    label = context.args[0].strip()
-    email_value = context.args[1].strip()
-    password = context.args[2].strip()
-    imap_host = guess_imap(email_value)
-
-    if not imap_host:
-        await update.message.reply_text("Не удалось определить IMAP сервер.")
-        return
-
-    config = load_config()
-
-    for item in config["emails"]:
-        if item["email"].lower() == email_value.lower():
-            await update.message.reply_text("Такая почта уже добавлена.")
-            return
-
-    config["emails"].append(
-        {
-            "label": label,
-            "email": email_value,
-            "password": password,
-            "imap": imap_host,
-            "seen_uids": [],
-        }
-    )
-    config["chat_id"] = OWNER_CHAT_ID
+    config["ui_state"] = STATE_IDLE
+    config["draft_email"] = {}
     save_config(config)
 
     await update.message.reply_text(
-        f"✅ Почта добавлена.\n"
-        f"Название: {label}\n"
-        f"Адрес: {email_value}\n"
-        f"IMAP: {imap_host}"
+        build_start_text(),
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(),
     )
 
 
-async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("remove_email"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Использование:\n/remove_email <email>")
-        return
-
-    email_value = context.args[0].strip().lower()
-    config = load_config()
-
-    old_len = len(config["emails"])
-    config["emails"] = [
-        item for item in config["emails"]
-        if item["email"].lower() != email_value
-    ]
-
-    if len(config["emails"]) == old_len:
-        await update.message.reply_text("Такая почта не найдена.")
-        return
-
-    save_config(config)
-    await update.message.reply_text(f"🗑 Почта {email_value} удалена.")
-
-
-async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("list_emails"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
+async def show_emails(update: Update) -> None:
     config = load_config()
     emails = config.get("emails", [])
 
     if not emails:
-        await update.message.reply_text("Почты ещё не добавлены.")
+        await update.message.reply_text("Почты ещё не добавлены.", reply_markup=get_main_keyboard())
         return
 
     text = "📮 <b>Добавленные почты</b>\n\n"
@@ -415,46 +338,10 @@ async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"   🌐 {imap_host}\n\n"
         )
 
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
-async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("set_poll"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Использование:\n/set_poll <секунды>")
-        return
-
-    try:
-        interval = int(context.args[0])
-        if interval < 10:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Интервал должен быть числом не меньше 10.")
-        return
-
-    config = load_config()
-    config["poll_interval"] = interval
-    save_config(config)
-
-    await update.message.reply_text(f"⏱ Интервал установлен: {interval} сек.")
-
-
-async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("show_config"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
+async def show_config(update: Update) -> None:
     config = load_config()
 
     safe_emails = []
@@ -472,28 +359,22 @@ async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "emails": safe_emails,
         "chat_id": OWNER_CHAT_ID,
         "poll_interval": config.get("poll_interval", DEFAULT_POLL_INTERVAL),
+        "ui_state": config.get("ui_state", STATE_IDLE),
     }
 
     await update.message.reply_text(
-        "Текущая конфигурация:\n" +
-        json.dumps(safe_config, indent=2, ensure_ascii=False)
+        "⚙️ Текущая конфигурация:\n" +
+        json.dumps(safe_config, indent=2, ensure_ascii=False),
+        reply_markup=get_main_keyboard(),
     )
 
 
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("test"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
+async def test_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "✅ <b>Тестовое сообщение</b>\n"
         "══════════════════\n"
         "Бот умеет отправлять сообщения в ваш чат.\n\n"
-        "Теперь можно использовать /run"
+        "Теперь можно нажать <b>▶️ Запуск</b>."
     )
 
     try:
@@ -502,25 +383,17 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text=text,
             parse_mode="HTML",
         )
-        await update.message.reply_text("Тест отправлен.")
+        await update.message.reply_text("Тест отправлен.", reply_markup=get_main_keyboard())
     except Exception as e:
-        await update.message.reply_text(f"Ошибка теста: {e}")
+        await update.message.reply_text(f"Ошибка теста: {e}", reply_markup=get_main_keyboard())
 
 
-async def spam_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("spam_status"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
+async def show_spam_status(update: Update) -> None:
     config = load_config()
     emails = config.get("emails", [])
 
     if not emails:
-        await update.message.reply_text("Почты ещё не добавлены.")
+        await update.message.reply_text("Почты ещё не добавлены.", reply_markup=get_main_keyboard())
         return
 
     lines = ["🛡 <b>Статус антиспама</b>\n"]
@@ -541,50 +414,250 @@ async def spam_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"• антиспам-уведомление: {'было' if last_alert else 'не было'}\n"
         )
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
-async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_polling(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global poll_task
 
-    if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
-        return
-
-    if not check_command_cooldown("run"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
-        return
-
     config = load_config()
-
     if not config.get("emails"):
-        await update.message.reply_text("Сначала добавь хотя бы одну почту через /add_email")
+        await update.message.reply_text(
+            "Сначала добавьте хотя бы одну почту через кнопку ➕ Добавить почту.",
+            reply_markup=get_main_keyboard(),
+        )
         return
 
     if poll_task and not poll_task.done():
-        await update.message.reply_text("Пересылка уже запущена.")
+        await update.message.reply_text("Пересылка уже запущена.", reply_markup=get_main_keyboard())
         return
 
     poll_task = context.application.create_task(poll_mail_loop(context))
-    await update.message.reply_text("🚀 Запускаю пересылку писем...")
+    await update.message.reply_text("🚀 Запускаю пересылку писем...", reply_markup=get_main_keyboard())
 
 
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def stop_polling(update: Update) -> None:
     global poll_task
 
+    if poll_task and not poll_task.done():
+        poll_task.cancel()
+        await update.message.reply_text("⛔ Пересылка остановлена.", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text("Пересылка не была запущена.", reply_markup=get_main_keyboard())
+
+
+async def begin_add_email(update: Update) -> None:
+    config = load_config()
+    config["ui_state"] = STATE_ADD_LABEL
+    config["draft_email"] = {}
+    save_config(config)
+
+    await update.message.reply_text(
+        "➕ Добавление почты\n\nВведите название ящика.\nНапример: ЛИЧНАЯ",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+async def begin_remove_email(update: Update) -> None:
+    config = load_config()
+    emails = config.get("emails", [])
+
+    if not emails:
+        await update.message.reply_text("Почты ещё не добавлены.", reply_markup=get_main_keyboard())
+        return
+
+    text = "🗑 Введите номер почты, которую хотите удалить:\n\n"
+    for idx, item in enumerate(emails, start=1):
+        text += f"{idx}. {item.get('label', 'БЕЗ НАЗВАНИЯ')} — {item['email']}\n"
+
+    config["ui_state"] = STATE_REMOVE_SELECT
+    save_config(config)
+
+    await update.message.reply_text(text, reply_markup=get_main_keyboard())
+
+
+async def begin_set_poll(update: Update) -> None:
+    config = load_config()
+    config["ui_state"] = STATE_SET_POLL
+    save_config(config)
+
+    await update.message.reply_text(
+        "⚙️ Введите новый интервал проверки в секундах.\nНапример: 60",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+async def cancel_action(update: Update) -> None:
+    config = load_config()
+    config["ui_state"] = STATE_IDLE
+    config["draft_email"] = {}
+    save_config(config)
+
+    await update.message.reply_text("Действие отменено.", reply_markup=get_main_keyboard())
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
         await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
         return
 
-    if not check_command_cooldown("stop"):
-        await update.message.reply_text("⏳ Не так быстро. Попробуйте через пару секунд.")
+    text = (update.message.text or "").strip()
+    config = load_config()
+    state = config.get("ui_state", STATE_IDLE)
+
+    # Кнопки главного меню
+    if text == "➕ Добавить почту":
+        await begin_add_email(update)
+        return
+    if text == "📋 Почты":
+        await show_emails(update)
+        return
+    if text == "🗑 Удалить почту":
+        await begin_remove_email(update)
+        return
+    if text == "▶️ Запуск":
+        await start_polling(update, context)
+        return
+    if text == "⏹ Стоп":
+        await stop_polling(update)
+        return
+    if text == "🧪 Тест":
+        await test_send(update, context)
+        return
+    if text == "🛡 Антиспам":
+        await show_spam_status(update)
+        return
+    if text == "⚙️ Настройки":
+        await begin_set_poll(update)
+        return
+    if text == "❓ Помощь":
+        await update.message.reply_text(
+            build_help_text(),
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    if text == "❌ Отмена":
+        await cancel_action(update)
         return
 
-    if poll_task and not poll_task.done():
-        poll_task.cancel()
-        await update.message.reply_text("⛔ Пересылка остановлена.")
-    else:
-        await update.message.reply_text("Пересылка не была запущена.")
+    # Пошаговый диалог
+    if state == STATE_ADD_LABEL:
+        config["draft_email"]["label"] = text
+        config["ui_state"] = STATE_ADD_EMAIL
+        save_config(config)
+        await update.message.reply_text("Теперь введите email ящика.")
+        return
+
+    if state == STATE_ADD_EMAIL:
+        if "@" not in text:
+            await update.message.reply_text("Это не похоже на email. Введите email ещё раз.")
+            return
+        config["draft_email"]["email"] = text
+        config["ui_state"] = STATE_ADD_PASSWORD
+        save_config(config)
+        await update.message.reply_text(
+            "Теперь введите пароль приложения (app password).\n"
+            "Для Gmail нужен именно app password."
+        )
+        return
+
+    if state == STATE_ADD_PASSWORD:
+        label = config["draft_email"].get("label", "БЕЗ НАЗВАНИЯ")
+        email_value = config["draft_email"].get("email", "")
+        password = text
+        imap_host = guess_imap(email_value)
+
+        if not email_value or not imap_host:
+            config["ui_state"] = STATE_IDLE
+            config["draft_email"] = {}
+            save_config(config)
+            await update.message.reply_text(
+                "Не удалось добавить почту. Попробуйте снова.",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+
+        for item in config["emails"]:
+            if item["email"].lower() == email_value.lower():
+                config["ui_state"] = STATE_IDLE
+                config["draft_email"] = {}
+                save_config(config)
+                await update.message.reply_text(
+                    "Такая почта уже добавлена.",
+                    reply_markup=get_main_keyboard(),
+                )
+                return
+
+        config["emails"].append(
+            {
+                "label": label,
+                "email": email_value,
+                "password": password,
+                "imap": imap_host,
+                "seen_uids": [],
+            }
+        )
+        config["ui_state"] = STATE_IDLE
+        config["draft_email"] = {}
+        save_config(config)
+
+        await update.message.reply_text(
+            f"✅ Почта добавлена.\n"
+            f"Название: {label}\n"
+            f"Адрес: {email_value}\n"
+            f"IMAP: {imap_host}",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    if state == STATE_REMOVE_SELECT:
+        try:
+            idx = int(text)
+        except ValueError:
+            await update.message.reply_text("Введите именно номер почты из списка.")
+            return
+
+        emails = config.get("emails", [])
+        if idx < 1 or idx > len(emails):
+            await update.message.reply_text("Такого номера нет. Попробуйте ещё раз.")
+            return
+
+        removed = emails.pop(idx - 1)
+        config["emails"] = emails
+        config["ui_state"] = STATE_IDLE
+        save_config(config)
+
+        await update.message.reply_text(
+            f"🗑 Почта удалена: {removed.get('label', removed.get('email', 'unknown'))}",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    if state == STATE_SET_POLL:
+        try:
+            interval = int(text)
+            if interval < 10:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите число не меньше 10.")
+            return
+
+        config["poll_interval"] = interval
+        config["ui_state"] = STATE_IDLE
+        save_config(config)
+
+        await update.message.reply_text(
+            f"⏱ Интервал установлен: {interval} сек.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    # Если просто текст вне сценария
+    await update.message.reply_text(
+        "Используйте кнопки ниже.",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 async def poll_mail_loop(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -706,16 +779,12 @@ def main() -> None:
     application: Application = ApplicationBuilder().token(token).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("add_email", add_email_cmd))
-    application.add_handler(CommandHandler("remove_email", remove_email_cmd))
-    application.add_handler(CommandHandler("list_emails", list_emails_cmd))
-    application.add_handler(CommandHandler("set_poll", set_poll_cmd))
-    application.add_handler(CommandHandler("show_config", show_config_cmd))
-    application.add_handler(CommandHandler("test", test_cmd))
-    application.add_handler(CommandHandler("spam_status", spam_status_cmd))
-    application.add_handler(CommandHandler("run", run_cmd))
-    application.add_handler(CommandHandler("stop", stop_cmd))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Chat(chat_id=OWNER_CHAT_ID),
+            handle_text,
+        )
+    )
 
     application.run_polling()
 
