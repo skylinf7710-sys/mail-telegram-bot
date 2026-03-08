@@ -4,8 +4,13 @@ import html
 import imaplib
 import json
 import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Application
+
 OWNER_CHAT_ID = 5127424995
 
+def is_owner(update) -> bool:
+    return update.effective_chat is not None and update.effective_chat.id == OWNER_CHAT_ID
 IMAP_BY_DOMAIN = {
     "gmail.com": "imap.gmail.com",
     "googlemail.com": "imap.gmail.com",
@@ -29,8 +34,6 @@ IMAP_BY_DOMAIN = {
     "yahoo.de": "imap.mail.yahoo.com",
     "yahoo.co.uk": "imap.mail.yahoo.com",
 }
-def is_owner(update: Update) -> bool:
-    return update.effective_chat is not None and update.effective_chat.id == OWNER_CHAT_ID
 
 def guess_imap(email_value: str) -> str:
     if "@" not in email_value:
