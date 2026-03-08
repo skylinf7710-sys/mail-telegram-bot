@@ -209,7 +209,7 @@ def format_email_message(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     config = load_config()
@@ -221,14 +221,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
     await update.message.reply_text(build_help_text(), parse_mode="HTML")
 
 
 async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     if len(context.args) < 3:
@@ -278,7 +278,7 @@ async def add_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     if not context.args:
@@ -304,7 +304,7 @@ async def remove_email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     config = load_config()
@@ -330,7 +330,7 @@ async def list_emails_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     if not context.args:
@@ -354,7 +354,7 @@ async def set_poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     config = load_config()
@@ -384,7 +384,7 @@ async def show_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     text = (
@@ -409,7 +409,7 @@ async def run_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global poll_task
 
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     config = load_config()
@@ -430,7 +430,7 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global poll_task
 
     if not is_owner(update):
-        await update.message.reply_text("⛔ Этот бот доступен только владельцу.")
+        await update.message.reply_text("⛔ Этот бот доступен только @skylinf.")
         return
 
     if poll_task and not poll_task.done():
